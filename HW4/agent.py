@@ -309,6 +309,70 @@ def _bounded_bfs(
 
     return None
 
+
+
+def _reconstruct(parent: Dict[str, Optional[str]], end_url: str) -> List[str]:
+    path = [end_url]
+    cur = end_url
+    while parent.get(cur) is not None:
+        cur = parent[cur]  # type: ignore[index]
+        path.append(cur)
+    path.reverse()
+    return path
+
+
+def _best_first_path(
+    start_url: str,
+    target_url: str,
+    target_title: str,
+    time_limit: float,
+    max_depth: int = 8,
+    max_expand: int = 260,
+) -> Optional[List[str]]:
+    """Global best-first fallback search that can recover from greedy drift."""
+    if start_url == target_url:
+        return [start_url]
+
+    frontier: List[Tuple[float, str]] = [(_score_title(_url_title(start_url), target_title), start_url)]
+    parent: Dict[str, Optional[str]] = {start_url: None}
+    depth: Dict[str, int] = {start_url: 0}
+    expanded = 0
+
+    while frontier and expanded < max_expand and time.time() < time_limit:
+        frontier.sort(key=lambda x: x[0], reverse=True)
+        _, u = frontier.pop(0)
+        d = depth[u]
+        if d >= max_depth:
+            continue
+
+        try:
+            links = _get_links_cached(u)
+        except Exception:
+            continue
+        expanded += 1
+
+        direct = next((l for l in links if l["url"] == target_url), None)
+        if direct is not None:
+            parent[target_url] = u
+            return _reconstruct(parent, target_url)
+
+        ranked = _rank_candidates(links, target_title, set(depth.keys()), k=36)
+        for score, l in ranked:
+            v = l["url"]
+            nd = d + 1
+            if nd > max_depth:
+                continue
+            if v not in depth or nd < depth[v]:
+                depth[v] = nd
+                parent[v] = u
+                frontier.append((score - 0.08 * nd, v))
+
+        if len(frontier) > 320:
+            frontier.sort(key=lambda x: x[0], reverse=True)
+            frontier = frontier[:320]
+
+    return None
+
 def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     pair_id = pair["pair_id"]
     start_url = pair["start"]
@@ -463,6 +527,26 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         elif (step - best_step) >= 3 and phase_i < len(phase_targets) - 1:
             phase_i += 1
             phase_target = phase_targets[phase_i]
+
+    # Last-resort global search from start if greedy phase strategy did not finish.
+    if (pair_deadline - time.time()) > 1.6:
+        fallback = _best_first_path(
+            start_url,
+            target_url,
+            target_title,
+            time_limit=min(pair_deadline - 0.1, time.time() + 1.5),
+            max_depth=8 if difficulty != "hard" else 9,
+            max_expand=220 if difficulty != "hard" else 320,
+        )
+        if fallback and len(fallback) >= 2 and _url_title(fallback[-1]).lower() == target_title.lower():
+            # link_counts for fallback path from cache where available
+            lc = []
+            for u in fallback[:-1]:
+                try:
+                    lc.append(len(_get_links_cached(u)))
+                except Exception:
+                    break
+            return _result(pair_id, fallback, llm_calls, lc, True)
 
     success = _url_title(path[-1]).lower() == target_title.lower()
     if len(path) < 2:
