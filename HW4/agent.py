@@ -125,33 +125,8 @@ def _score_title(title: str, target_title: str) -> float:
     if tl in gl or gl in tl:
         s += 1.4
     s += _hub_bonus(title, target_title)
-    s += _theme_boost(title, target_title)
     s -= _quality_penalty(title)
     return s
-
-
-def _target_bridge_chain(target_title: str) -> List[str]:
-    t = target_title.lower()
-    if "roman law" in t:
-        return ["Law", "Ancient Rome", "Roman Empire"]
-    if "plate tectonics" in t:
-        return ["Geology", "Earth science", "Tectonics"]
-    if "nuclear physics" in t:
-        return ["Physics", "Atom"]
-    return []
-
-
-def _theme_boost(title: str, target_title: str) -> float:
-    t = title.lower()
-    g = target_title.lower()
-    boost = 0.0
-    if "roman law" in g:
-        if any(k in t for k in ("law", "roman", "rome", "juris")):
-            boost += 0.9
-    if "plate tectonics" in g:
-        if any(k in t for k in ("geolog", "earth", "tecton", "lithosphere", "crust", "mantle")):
-            boost += 1.0
-    return boost
 
 
 
@@ -421,17 +396,10 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     except Exception:
         llm_plan = []
 
-    phase_targets: List[str] = []
-    for b in _target_bridge_chain(target_title):
-        if b not in phase_targets:
-            phase_targets.append(b)
-    for b in llm_plan:
-        if b not in phase_targets:
-            phase_targets.append(b)
+    phase_targets = llm_plan[:]
     if pivot_title and pivot_title not in phase_targets:
         phase_targets.append(pivot_title)
-    if target_title not in phase_targets:
-        phase_targets.append(target_title)
+    phase_targets.append(target_title)
     phase_i = 0
     phase_target = phase_targets[phase_i]
 
@@ -495,7 +463,7 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             continue
 
         # Keep trying 2-hop checks, not only at the beginning.
-        burst = _two_hop_check(current, target_url, ranked, budget_expand=14)
+        burst = _two_hop_check(current, target_url, ranked, budget_expand=10)
         if burst is not None:
             path.extend(burst[1:])
             return _result(pair_id, path, llm_calls, link_counts, True)
@@ -562,14 +530,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
 
     # Last-resort global search from start if greedy phase strategy did not finish.
     if (pair_deadline - time.time()) > 1.6:
-        extra = 2.2 if ("roman law" in target_title.lower() or "plate tectonics" in target_title.lower()) else 1.5
         fallback = _best_first_path(
             start_url,
             target_url,
             target_title,
-            time_limit=min(pair_deadline - 0.1, time.time() + extra),
-            max_depth=9 if ("plate tectonics" in target_title.lower()) else (8 if difficulty != "hard" else 9),
-            max_expand=300 if ("roman law" in target_title.lower() or "plate tectonics" in target_title.lower()) else (220 if difficulty != "hard" else 320),
+            time_limit=min(pair_deadline - 0.1, time.time() + 1.5),
+            max_depth=8 if difficulty != "hard" else 9,
+            max_expand=220 if difficulty != "hard" else 320,
         )
         if fallback and len(fallback) >= 2 and _url_title(fallback[-1]).lower() == target_title.lower():
             # link_counts for fallback path from cache where available
