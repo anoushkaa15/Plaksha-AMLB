@@ -46,6 +46,13 @@ _HUB_HINTS = {
     "politics", "engineering", "education", "society", "renaissance", "war",
 }
 
+_PLAN_CONCEPTS = [
+    "History", "Science", "Technology", "Mathematics", "Physics", "Biology",
+    "Chemistry", "Geology", "Law", "Philosophy", "Engineering", "Economics",
+    "Society", "Culture", "Religion", "Geography",
+]
+
+
 
 def _ask_gemini(prompt: str) -> str:
     body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
@@ -122,6 +129,36 @@ def _score_title(title: str, target_title: str) -> float:
     return s
 
 
+
+
+
+
+def _llm_plan_bridges(start_title: str, target_title: str) -> List[str]:
+    opts = ", ".join(_PLAN_CONCEPTS)
+    prompt = (
+        "Pick up to TWO bridge Wikipedia concepts to navigate from START to GOAL.\n"
+        f"START: {start_title}\n"
+        f"GOAL: {target_title}\n"
+        f"Allowed concepts only: {opts}\n"
+        "Return ONLY JSON array, e.g. [\"History\",\"Science\"]"
+    )
+    out = _ask_gemini(prompt)
+    m = re.search(r"\[[\s\S]*\]", out)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:
+        return []
+    picked = []
+    allowed = {x.lower(): x for x in _PLAN_CONCEPTS}
+    for v in arr[:2]:
+        if not isinstance(v, str):
+            continue
+        key = v.strip().lower()
+        if key in allowed and allowed[key] not in picked:
+            picked.append(allowed[key])
+    return picked
 
 
 def _choose_pivot(target_title: str) -> Optional[str]:
@@ -223,6 +260,55 @@ def _two_hop_check(current_url: str, target_url: str, ranked: Sequence[Tuple[flo
     return None
 
 
+
+
+def _bounded_bfs(
+    start_url: str,
+    target_url: str,
+    target_title: str,
+    visited_hint: Set[str],
+    depth_limit: int,
+    node_limit: int,
+    local_deadline: float,
+) -> Optional[List[str]]:
+    """Small best-first BFS burst to recover from local traps."""
+    if start_url == target_url:
+        return [start_url]
+
+    q: List[Tuple[List[str], int]] = [([start_url], 0)]
+    seen = {start_url, *visited_hint}
+    expanded = 0
+
+    while q and expanded < node_limit and time.time() < local_deadline:
+        path, depth = q.pop(0)
+        u = path[-1]
+        if depth >= depth_limit:
+            continue
+        try:
+            links = _get_links_cached(u)
+        except Exception:
+            continue
+        expanded += 1
+
+        direct = next((l for l in links if l["url"] == target_url), None)
+        if direct is not None:
+            return path + [target_url]
+
+        ranked = _rank_candidates(links, target_title, seen, k=18)
+        for _, l in ranked:
+            v = l["url"]
+            if v in seen:
+                continue
+            seen.add(v)
+            q.append((path + [v], depth + 1))
+
+        # Keep frontier focused on promising nodes.
+        if len(q) > 120:
+            q.sort(key=lambda item: _score_title(_url_title(item[0][-1]), target_title), reverse=True)
+            q = q[:120]
+
+    return None
+
 def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     pair_id = pair["pair_id"]
     start_url = pair["start"]
@@ -230,15 +316,30 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     target_title = _url_title(target_url)
     difficulty = pair.get("difficulty", "medium")
     pivot_title = _choose_pivot(target_title)
-    phase_target = pivot_title or target_title
+    llm_plan: List[str] = []
+    llm_calls = 0
+    try:
+        llm_plan = _llm_plan_bridges(_url_title(start_url), target_title)
+        if llm_plan:
+            llm_calls += 1
+    except Exception:
+        llm_plan = []
+
+    phase_targets = llm_plan[:]
+    if pivot_title and pivot_title not in phase_targets:
+        phase_targets.append(pivot_title)
+    phase_targets.append(target_title)
+    phase_i = 0
+    phase_target = phase_targets[phase_i]
 
     # step cap tuned for score/time tradeoff
     max_steps = {"easy": 8, "medium": 10, "hard": 8}.get(difficulty, 9)
     llm_budget = {"easy": 4, "medium": 6, "hard": 3}.get(difficulty, 4)
+    bfs_node_budget = {"easy": 60, "medium": 120, "hard": 180}.get(difficulty, 100)
+    bfs_used = False
 
     path = [start_url]
     visited = {start_url}
-    llm_calls = 0
     link_counts: List[int] = []
     current = start_url
 
@@ -251,10 +352,12 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         if current == target_url or curr_title.lower() == target_title.lower():
             return _result(pair_id, path, llm_calls, link_counts, True)
 
-        if pivot_title and phase_target != target_title:
-            ct = curr_title.lower()
-            if ct == pivot_title.lower() or pivot_title.lower() in ct:
-                phase_target = target_title
+        ct = curr_title.lower()
+        if phase_i < len(phase_targets) - 1:
+            goal_l = phase_target.lower()
+            if ct == goal_l or goal_l in ct:
+                phase_i += 1
+                phase_target = phase_targets[phase_i]
 
         try:
             links = _get_links_cached(current)
@@ -270,10 +373,10 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             path.append(target_url)
             return _result(pair_id, path, llm_calls, link_counts, True)
 
-        if pivot_title and phase_target != target_title:
-            pivot_link = next((l for l in links if _url_title(l["url"]).lower() == pivot_title.lower()), None)
-            if pivot_link is not None:
-                current = pivot_link["url"]
+        if phase_target != target_title:
+            phase_link = next((l for l in links if _url_title(l["url"]).lower() == phase_target.lower()), None)
+            if phase_link is not None:
+                current = phase_link["url"]
                 path.append(current)
                 visited.add(current)
                 continue
@@ -285,6 +388,22 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             path.append(current)
             visited.add(current)
             continue
+
+        # One focused BFS burst per pair can recover from near-target traps.
+        if (not bfs_used) and step >= 2 and (pair_deadline - time.time()) > 2.4:
+            bfs_used = True
+            bfs_path = _bounded_bfs(
+                current,
+                target_url,
+                target_title,
+                visited,
+                depth_limit=3,
+                node_limit=bfs_node_budget,
+                local_deadline=min(pair_deadline - 0.3, time.time() + 2.2),
+            )
+            if bfs_path and len(bfs_path) >= 2:
+                path.extend(bfs_path[1:])
+                return _result(pair_id, path, llm_calls, link_counts, True)
 
         # Early 2-hop check over strong candidates only
         if step <= 2:
@@ -304,6 +423,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
                     picked = shortlist[idx]
             except Exception:
                 picked = None
+
+        if picked is None:
+            # Escape local traps: if target similarity is still tiny after a few steps, prefer broad hub pages.
+            if step >= 3 and _score_title(_url_title(current), target_title) < 0.25:
+                hub = next((l for _, l in ranked if any(h in l["text"].lower() for h in _HUB_HINTS)), None)
+                if hub is not None:
+                    picked = hub
 
         if picked is None:
             # mild randomness in top 3 prevents deterministic local traps
