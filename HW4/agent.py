@@ -10,7 +10,6 @@ import random
 import re
 import time
 import urllib.request
-import heapq
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from wiki_tool import get_links
@@ -55,7 +54,7 @@ _PLAN_CONCEPTS = [
 
 
 
-def _ask_gemini(prompt: str, timeout_s: float = 12.0) -> str:
+def _ask_gemini(prompt: str) -> str:
     body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
     req = urllib.request.Request(
         _GEMINI_URL,
@@ -63,7 +62,7 @@ def _ask_gemini(prompt: str, timeout_s: float = 12.0) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=max(1.0, timeout_s)) as r:
+    with urllib.request.urlopen(req, timeout=12) as r:
         data = json.loads(r.read().decode("utf-8"))
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -126,57 +125,15 @@ def _score_title(title: str, target_title: str) -> float:
     if tl in gl or gl in tl:
         s += 1.4
     s += _hub_bonus(title, target_title)
-    s += _theme_boost(title, target_title)
-    s -= _concept_drift_penalty(title, target_title)
     s -= _quality_penalty(title)
     return s
 
 
-def _target_bridge_chain(target_title: str) -> List[str]:
-    t = target_title.lower()
-    if "roman law" in t:
-        return ["Law", "Legal history", "Ancient Rome", "Roman Empire"]
-    if "plate tectonics" in t:
-        return ["Earth", "Earthquake", "Geology", "Earth science", "Tectonics"]
-    if "nuclear physics" in t:
-        return ["Physics", "Atom"]
-    return []
-
-
-def _theme_boost(title: str, target_title: str) -> float:
-    t = title.lower()
-    g = target_title.lower()
-    boost = 0.0
-    if "roman law" in g:
-        if any(k in t for k in ("law", "roman", "rome", "juris")):
-            boost += 0.9
-    if "plate tectonics" in g:
-        if any(k in t for k in ("geolog", "earth", "tecton", "lithosphere", "crust", "mantle")):
-            boost += 1.0
-    return boost
-
-
-def _concept_drift_penalty(title: str, target_title: str) -> float:
-    """Penalty for drifting into named entities when target is abstract concept."""
-    t = title.lower()
-    g = target_title.lower()
-    if "roman law" not in g and "plate tectonics" not in g:
-        return 0.0
-    p = 0.0
-    if any(k in t for k in ("university", "college", "society", "institute", "academy")):
-        p += 0.8
-    if any(k in t for k in ("city", "district", "province", "politics of", "economics")):
-        p += 0.7
-    if any(k in t for k in ("matthews", "born", "biography")):
-        p += 0.6
-    return p
 
 
 
 
-
-
-def _llm_plan_bridges(start_title: str, target_title: str, timeout_s: float = 7.0) -> List[str]:
+def _llm_plan_bridges(start_title: str, target_title: str) -> List[str]:
     opts = ", ".join(_PLAN_CONCEPTS)
     prompt = (
         "Pick up to TWO bridge Wikipedia concepts to navigate from START to GOAL.\n"
@@ -185,7 +142,7 @@ def _llm_plan_bridges(start_title: str, target_title: str, timeout_s: float = 7.
         f"Allowed concepts only: {opts}\n"
         "Return ONLY JSON array, e.g. [\"History\",\"Science\"]"
     )
-    out = _ask_gemini(prompt, timeout_s=timeout_s)
+    out = _ask_gemini(prompt)
     m = re.search(r"\[[\s\S]*\]", out)
     if not m:
         return []
@@ -266,7 +223,7 @@ def _rank_candidates(
     return scored[:k]
 
 
-def _llm_pick(current_title: str, target_title: str, candidates: Sequence[Dict[str, str]], timeout_s: float = 5.0) -> Optional[int]:
+def _llm_pick(current_title: str, target_title: str, candidates: Sequence[Dict[str, str]]) -> Optional[int]:
     if not candidates:
         return None
     numbered = "\n".join(f"{i+1}. {c['text']}" for i, c in enumerate(candidates))
@@ -279,7 +236,7 @@ def _llm_pick(current_title: str, target_title: str, candidates: Sequence[Dict[s
         "Reply with ONLY one integer index.\n\n"
         f"Options:\n{numbered}"
     )
-    out = _ask_gemini(prompt, timeout_s=timeout_s).strip()
+    out = _ask_gemini(prompt).strip()
     m = re.search(r"\d+", out)
     if not m:
         return None
@@ -376,13 +333,14 @@ def _best_first_path(
     if start_url == target_url:
         return [start_url]
 
-    frontier: List[Tuple[float, str]] = [(-_score_title(_url_title(start_url), target_title), start_url)]
+    frontier: List[Tuple[float, str]] = [(_score_title(_url_title(start_url), target_title), start_url)]
     parent: Dict[str, Optional[str]] = {start_url: None}
     depth: Dict[str, int] = {start_url: 0}
     expanded = 0
 
     while frontier and expanded < max_expand and time.time() < time_limit:
-        _, u = heapq.heappop(frontier)
+        frontier.sort(key=lambda x: x[0], reverse=True)
+        _, u = frontier.pop(0)
         d = depth[u]
         if d >= max_depth:
             continue
@@ -407,11 +365,11 @@ def _best_first_path(
             if v not in depth or nd < depth[v]:
                 depth[v] = nd
                 parent[v] = u
-                heapq.heappush(frontier, (-(score - 0.08 * nd), v))
+                frontier.append((score - 0.08 * nd, v))
 
         if len(frontier) > 320:
-            frontier = heapq.nsmallest(320, frontier)
-            heapq.heapify(frontier)
+            frontier.sort(key=lambda x: x[0], reverse=True)
+            frontier = frontier[:320]
 
     return None
 
@@ -423,38 +381,25 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     difficulty = pair.get("difficulty", "medium")
     pivot_title = _choose_pivot(target_title)
 
-    # Harder pairs need more search and some LLM guidance, but LLM calls must stay bounded.
+    # Harder pairs need more search and more LLM guidance.
     max_steps = {"easy": 8, "medium": 11, "hard": 13}.get(difficulty, 10)
-    llm_budget = {"easy": 1, "medium": 3, "hard": 5}.get(difficulty, 3)
+    llm_budget = {"easy": 4, "medium": 7, "hard": 11}.get(difficulty, 6)
     bfs_node_budget = {"easy": 80, "medium": 180, "hard": 320}.get(difficulty, 140)
     bfs_max_tries = {"easy": 1, "medium": 2, "hard": 3}.get(difficulty, 2)
 
     llm_plan: List[str] = []
     llm_calls = 0
-    # Planning call can be expensive; reserve it for hard pairs with comfortable time.
-    if difficulty == "hard" and (pair_deadline - time.time()) > 5.0:
-        try:
-            llm_plan = _llm_plan_bridges(
-                _url_title(start_url),
-                target_title,
-                timeout_s=min(2.4, max(1.2, pair_deadline - time.time() - 2.5)),
-            )
-            if llm_plan:
-                llm_calls += 1
-        except Exception:
-            llm_plan = []
+    try:
+        llm_plan = _llm_plan_bridges(_url_title(start_url), target_title)
+        if llm_plan:
+            llm_calls += 1
+    except Exception:
+        llm_plan = []
 
-    phase_targets: List[str] = []
-    for b in _target_bridge_chain(target_title):
-        if b not in phase_targets:
-            phase_targets.append(b)
-    for b in llm_plan:
-        if b not in phase_targets:
-            phase_targets.append(b)
+    phase_targets = llm_plan[:]
     if pivot_title and pivot_title not in phase_targets:
         phase_targets.append(pivot_title)
-    if target_title not in phase_targets:
-        phase_targets.append(target_title)
+    phase_targets.append(target_title)
     phase_i = 0
     phase_target = phase_targets[phase_i]
 
@@ -518,7 +463,7 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             continue
 
         # Keep trying 2-hop checks, not only at the beginning.
-        burst = _two_hop_check(current, target_url, ranked, budget_expand=14)
+        burst = _two_hop_check(current, target_url, ranked, budget_expand=10)
         if burst is not None:
             path.extend(burst[1:])
             return _result(pair_id, path, llm_calls, link_counts, True)
@@ -548,15 +493,9 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         picked = None
 
         # Ask LLM more on hard pairs.
-        # Keep reranking calls short to avoid deadline overruns.
-        if llm_calls < llm_budget and len(shortlist) >= 4 and (pair_deadline - time.time()) > 2.2:
+        if llm_calls < llm_budget and len(shortlist) >= 4:
             try:
-                idx = _llm_pick(
-                    curr_title,
-                    phase_target,
-                    shortlist,
-                    timeout_s=min(2.0, max(1.0, pair_deadline - time.time() - 1.6)),
-                )
+                idx = _llm_pick(curr_title, phase_target, shortlist)
                 llm_calls += 1
                 if idx is not None:
                     picked = shortlist[idx]
@@ -591,14 +530,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
 
     # Last-resort global search from start if greedy phase strategy did not finish.
     if (pair_deadline - time.time()) > 1.6:
-        extra = 2.2 if ("roman law" in target_title.lower() or "plate tectonics" in target_title.lower()) else 1.5
         fallback = _best_first_path(
             start_url,
             target_url,
             target_title,
-            time_limit=min(pair_deadline - 0.1, time.time() + extra),
-            max_depth=9 if ("plate tectonics" in target_title.lower()) else (8 if difficulty != "hard" else 9),
-            max_expand=300 if ("roman law" in target_title.lower() or "plate tectonics" in target_title.lower()) else (220 if difficulty != "hard" else 320),
+            time_limit=min(pair_deadline - 0.1, time.time() + 1.5),
+            max_depth=8 if difficulty != "hard" else 9,
+            max_expand=220 if difficulty != "hard" else 320,
         )
         if fallback and len(fallback) >= 2 and _url_title(fallback[-1]).lower() == target_title.lower():
             # link_counts for fallback path from cache where available
