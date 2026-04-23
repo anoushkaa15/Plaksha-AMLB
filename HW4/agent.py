@@ -122,6 +122,23 @@ def _score_title(title: str, target_title: str) -> float:
     return s
 
 
+
+
+def _choose_pivot(target_title: str) -> Optional[str]:
+    t = target_title.lower()
+    # Lightweight hand-tuned pivots for common "hard jump" targets.
+    if "roman law" in t:
+        return "Law"
+    if "nuclear physics" in t:
+        return "Physics"
+    if "plate tectonics" in t:
+        return "Geology"
+    if "mathematics" in t:
+        return "Mathematics"
+    if "computer science" in t:
+        return "Science"
+    return None
+
 def _get_links_cached(url: str) -> List[Dict[str, str]]:
     if url in _LINK_CACHE:
         return _LINK_CACHE[url]
@@ -212,6 +229,8 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     target_url = pair["target"]
     target_title = _url_title(target_url)
     difficulty = pair.get("difficulty", "medium")
+    pivot_title = _choose_pivot(target_title)
+    phase_target = pivot_title or target_title
 
     # step cap tuned for score/time tradeoff
     max_steps = {"easy": 8, "medium": 10, "hard": 8}.get(difficulty, 9)
@@ -228,8 +247,14 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         if now >= pair_deadline or now >= hard_deadline - 0.35:
             break
 
-        if current == target_url or _url_title(current).lower() == target_title.lower():
+        curr_title = _url_title(current)
+        if current == target_url or curr_title.lower() == target_title.lower():
             return _result(pair_id, path, llm_calls, link_counts, True)
+
+        if pivot_title and phase_target != target_title:
+            ct = curr_title.lower()
+            if ct == pivot_title.lower() or pivot_title.lower() in ct:
+                phase_target = target_title
 
         try:
             links = _get_links_cached(current)
@@ -245,7 +270,15 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             path.append(target_url)
             return _result(pair_id, path, llm_calls, link_counts, True)
 
-        ranked = _rank_candidates(links, target_title, visited, k=16)
+        if pivot_title and phase_target != target_title:
+            pivot_link = next((l for l in links if _url_title(l["url"]).lower() == pivot_title.lower()), None)
+            if pivot_link is not None:
+                current = pivot_link["url"]
+                path.append(current)
+                visited.add(current)
+                continue
+
+        ranked = _rank_candidates(links, phase_target, visited, k=16)
         if not ranked:
             fallback = next((l for l in links if l["url"] not in visited), links[0])
             current = fallback["url"]
@@ -265,7 +298,7 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
 
         if llm_calls < llm_budget and len(shortlist) >= 4:
             try:
-                idx = _llm_pick(_url_title(current), target_title, shortlist)
+                idx = _llm_pick(_url_title(current), phase_target, shortlist)
                 llm_calls += 1
                 if idx is not None:
                     picked = shortlist[idx]
