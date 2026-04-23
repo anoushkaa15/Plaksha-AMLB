@@ -316,6 +316,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     target_title = _url_title(target_url)
     difficulty = pair.get("difficulty", "medium")
     pivot_title = _choose_pivot(target_title)
+
+    # Harder pairs need more search and more LLM guidance.
+    max_steps = {"easy": 8, "medium": 11, "hard": 13}.get(difficulty, 10)
+    llm_budget = {"easy": 4, "medium": 7, "hard": 11}.get(difficulty, 6)
+    bfs_node_budget = {"easy": 80, "medium": 180, "hard": 320}.get(difficulty, 140)
+    bfs_max_tries = {"easy": 1, "medium": 2, "hard": 3}.get(difficulty, 2)
+
     llm_plan: List[str] = []
     llm_calls = 0
     try:
@@ -332,16 +339,15 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     phase_i = 0
     phase_target = phase_targets[phase_i]
 
-    # step cap tuned for score/time tradeoff
-    max_steps = {"easy": 8, "medium": 10, "hard": 8}.get(difficulty, 9)
-    llm_budget = {"easy": 4, "medium": 6, "hard": 3}.get(difficulty, 4)
-    bfs_node_budget = {"easy": 60, "medium": 120, "hard": 180}.get(difficulty, 100)
-    bfs_used = False
-
     path = [start_url]
     visited = {start_url}
     link_counts: List[int] = []
     current = start_url
+
+    best_progress = _score_title(_url_title(start_url), target_title)
+    best_step = 0
+    bfs_tries = 0
+    last_bfs_step = -99
 
     for step in range(max_steps):
         now = time.time()
@@ -352,6 +358,7 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         if current == target_url or curr_title.lower() == target_title.lower():
             return _result(pair_id, path, llm_calls, link_counts, True)
 
+        # Phase target can be wrong: advance if reached OR if it's clearly unhelpful and we're stuck.
         ct = curr_title.lower()
         if phase_i < len(phase_targets) - 1:
             goal_l = phase_target.lower()
@@ -368,11 +375,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
         if not links:
             break
 
+        # Direct target hit always wins.
         direct = next((l for l in links if l["url"] == target_url), None)
         if direct:
             path.append(target_url)
             return _result(pair_id, path, llm_calls, link_counts, True)
 
+        # Direct phase-target jump if available.
         if phase_target != target_title:
             phase_link = next((l for l in links if _url_title(l["url"]).lower() == phase_target.lower()), None)
             if phase_link is not None:
@@ -381,7 +390,7 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
                 visited.add(current)
                 continue
 
-        ranked = _rank_candidates(links, phase_target, visited, k=16)
+        ranked = _rank_candidates(links, phase_target, visited, k=18)
         if not ranked:
             fallback = next((l for l in links if l["url"] not in visited), links[0])
             current = fallback["url"]
@@ -389,35 +398,40 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             visited.add(current)
             continue
 
-        # One focused BFS burst per pair can recover from near-target traps.
-        if (not bfs_used) and step >= 2 and (pair_deadline - time.time()) > 2.4:
-            bfs_used = True
+        # Keep trying 2-hop checks, not only at the beginning.
+        burst = _two_hop_check(current, target_url, ranked, budget_expand=10)
+        if burst is not None:
+            path.extend(burst[1:])
+            return _result(pair_id, path, llm_calls, link_counts, True)
+
+        # Repeated BFS rescue for hard semantic jumps.
+        if (
+            bfs_tries < bfs_max_tries
+            and step - last_bfs_step >= 2
+            and (pair_deadline - time.time()) > 2.4
+        ):
+            bfs_tries += 1
+            last_bfs_step = step
             bfs_path = _bounded_bfs(
                 current,
                 target_url,
                 target_title,
                 visited,
-                depth_limit=3,
+                depth_limit=4,
                 node_limit=bfs_node_budget,
-                local_deadline=min(pair_deadline - 0.3, time.time() + 2.2),
+                local_deadline=min(pair_deadline - 0.25, time.time() + (1.2 + 0.6 * bfs_tries)),
             )
             if bfs_path and len(bfs_path) >= 2:
                 path.extend(bfs_path[1:])
                 return _result(pair_id, path, llm_calls, link_counts, True)
 
-        # Early 2-hop check over strong candidates only
-        if step <= 2:
-            burst = _two_hop_check(current, target_url, ranked, budget_expand=8)
-            if burst is not None:
-                path.extend(burst[1:])
-                return _result(pair_id, path, llm_calls, link_counts, True)
-
         shortlist = [l for _, l in ranked[:10]]
         picked = None
 
+        # Ask LLM more on hard pairs.
         if llm_calls < llm_budget and len(shortlist) >= 4:
             try:
-                idx = _llm_pick(_url_title(current), phase_target, shortlist)
+                idx = _llm_pick(curr_title, phase_target, shortlist)
                 llm_calls += 1
                 if idx is not None:
                     picked = shortlist[idx]
@@ -425,20 +439,30 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
                 picked = None
 
         if picked is None:
-            # Escape local traps: if target similarity is still tiny after a few steps, prefer broad hub pages.
-            if step >= 3 and _score_title(_url_title(current), target_title) < 0.25:
+            # If no progress for a while, bias toward broad hubs to escape local clusters.
+            no_progress = (step - best_step) >= 2
+            if no_progress:
                 hub = next((l for _, l in ranked if any(h in l["text"].lower() for h in _HUB_HINTS)), None)
                 if hub is not None:
                     picked = hub
 
         if picked is None:
-            # mild randomness in top 3 prevents deterministic local traps
-            top = [l for _, l in ranked[:3]]
-            picked = random.choice(top) if len(top) > 1 and step >= 3 else top[0]
+            # Backtracking-ish behavior: avoid locking into one bad deterministic branch.
+            top = [l for _, l in ranked[:4]]
+            picked = random.choice(top) if len(top) > 1 else top[0]
 
         current = picked["url"]
         path.append(current)
         visited.add(current)
+
+        # Track progress toward final target; if stuck, relax phase and move on.
+        prog = _score_title(_url_title(current), target_title)
+        if prog > best_progress + 0.05:
+            best_progress = prog
+            best_step = step + 1
+        elif (step - best_step) >= 3 and phase_i < len(phase_targets) - 1:
+            phase_i += 1
+            phase_target = phase_targets[phase_i]
 
     success = _url_title(path[-1]).lower() == target_title.lower()
     if len(path) < 2:
@@ -468,13 +492,13 @@ def solve_all(pairs: list, deadline: float) -> list:
         per_pair = max(2.0, rem_time / max(1, remaining))
 
         d = pair.get("difficulty", "medium")
-        # Invest more in easy/medium where score probability is higher.
+        # Hard pairs need more budget for semantic jumps.
         if d == "easy":
-            pair_budget = min(18.0, per_pair * 1.45)
+            pair_budget = min(14.0, per_pair * 1.00)
         elif d == "medium":
-            pair_budget = min(14.0, per_pair * 1.10)
+            pair_budget = min(16.0, per_pair * 1.15)
         else:
-            pair_budget = min(8.0, per_pair * 0.80)
+            pair_budget = min(22.0, per_pair * 1.45)
 
         pair_deadline = min(deadline - 0.4, now + pair_budget)
 
