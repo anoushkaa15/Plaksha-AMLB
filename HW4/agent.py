@@ -53,9 +53,13 @@ _PLAN_CONCEPTS = [
     "Society", "Culture", "Religion", "Geography",
 ]
 
+_LLM_DISABLED = False
+_LLM_FAILS = 0
 
-
-def _ask_gemini(prompt: str, timeout_s: float = 12.0) -> str:
+def _ask_gemini(prompt: str, timeout_s: float = 2.2) -> str:
+    global _LLM_DISABLED, _LLM_FAILS
+    if _LLM_DISABLED:
+        return ""
     body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
     req = urllib.request.Request(
         _GEMINI_URL,
@@ -63,9 +67,15 @@ def _ask_gemini(prompt: str, timeout_s: float = 12.0) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=max(1.0, timeout_s)) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.8, timeout_s)) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        _LLM_FAILS += 1
+        if _LLM_FAILS >= 1:
+            _LLM_DISABLED = True
+        return ""
 
 
 def _url_title(url: str) -> str:
@@ -425,19 +435,19 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
 
     # Harder pairs need more search and some LLM guidance, but LLM calls must stay bounded.
     max_steps = {"easy": 8, "medium": 11, "hard": 13}.get(difficulty, 10)
-    llm_budget = {"easy": 1, "medium": 3, "hard": 5}.get(difficulty, 3)
+    llm_budget = {"easy": 0, "medium": 1, "hard": 2}.get(difficulty, 1)
     bfs_node_budget = {"easy": 80, "medium": 180, "hard": 320}.get(difficulty, 140)
     bfs_max_tries = {"easy": 1, "medium": 2, "hard": 3}.get(difficulty, 2)
 
     llm_plan: List[str] = []
     llm_calls = 0
     # Planning call can be expensive; reserve it for hard pairs with comfortable time.
-    if difficulty == "hard" and (pair_deadline - time.time()) > 5.0:
+    if (not _LLM_DISABLED) and difficulty == "hard" and (pair_deadline - time.time()) > 4.0:
         try:
             llm_plan = _llm_plan_bridges(
                 _url_title(start_url),
                 target_title,
-                timeout_s=min(2.4, max(1.2, pair_deadline - time.time() - 2.5)),
+                timeout_s=min(1.6, max(0.8, pair_deadline - time.time() - 2.8)),
             )
             if llm_plan:
                 llm_calls += 1
@@ -549,13 +559,13 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
 
         # Ask LLM more on hard pairs.
         # Keep reranking calls short to avoid deadline overruns.
-        if llm_calls < llm_budget and len(shortlist) >= 4 and (pair_deadline - time.time()) > 2.2:
+        if (not _LLM_DISABLED) and llm_calls < llm_budget and len(shortlist) >= 4 and (pair_deadline - time.time()) > 1.8:
             try:
                 idx = _llm_pick(
                     curr_title,
                     phase_target,
                     shortlist,
-                    timeout_s=min(2.0, max(1.0, pair_deadline - time.time() - 1.6)),
+                    timeout_s=min(1.4, max(0.8, pair_deadline - time.time() - 1.6)),
                 )
                 llm_calls += 1
                 if idx is not None:
