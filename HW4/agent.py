@@ -260,6 +260,55 @@ def _two_hop_check(current_url: str, target_url: str, ranked: Sequence[Tuple[flo
     return None
 
 
+
+
+def _bounded_bfs(
+    start_url: str,
+    target_url: str,
+    target_title: str,
+    visited_hint: Set[str],
+    depth_limit: int,
+    node_limit: int,
+    local_deadline: float,
+) -> Optional[List[str]]:
+    """Small best-first BFS burst to recover from local traps."""
+    if start_url == target_url:
+        return [start_url]
+
+    q: List[Tuple[List[str], int]] = [([start_url], 0)]
+    seen = {start_url, *visited_hint}
+    expanded = 0
+
+    while q and expanded < node_limit and time.time() < local_deadline:
+        path, depth = q.pop(0)
+        u = path[-1]
+        if depth >= depth_limit:
+            continue
+        try:
+            links = _get_links_cached(u)
+        except Exception:
+            continue
+        expanded += 1
+
+        direct = next((l for l in links if l["url"] == target_url), None)
+        if direct is not None:
+            return path + [target_url]
+
+        ranked = _rank_candidates(links, target_title, seen, k=18)
+        for _, l in ranked:
+            v = l["url"]
+            if v in seen:
+                continue
+            seen.add(v)
+            q.append((path + [v], depth + 1))
+
+        # Keep frontier focused on promising nodes.
+        if len(q) > 120:
+            q.sort(key=lambda item: _score_title(_url_title(item[0][-1]), target_title), reverse=True)
+            q = q[:120]
+
+    return None
+
 def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     pair_id = pair["pair_id"]
     start_url = pair["start"]
@@ -286,6 +335,8 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
     # step cap tuned for score/time tradeoff
     max_steps = {"easy": 8, "medium": 10, "hard": 8}.get(difficulty, 9)
     llm_budget = {"easy": 4, "medium": 6, "hard": 3}.get(difficulty, 4)
+    bfs_node_budget = {"easy": 60, "medium": 120, "hard": 180}.get(difficulty, 100)
+    bfs_used = False
 
     path = [start_url]
     visited = {start_url}
@@ -337,6 +388,22 @@ def _solve_one(pair: dict, pair_deadline: float, hard_deadline: float) -> dict:
             path.append(current)
             visited.add(current)
             continue
+
+        # One focused BFS burst per pair can recover from near-target traps.
+        if (not bfs_used) and step >= 2 and (pair_deadline - time.time()) > 2.4:
+            bfs_used = True
+            bfs_path = _bounded_bfs(
+                current,
+                target_url,
+                target_title,
+                visited,
+                depth_limit=3,
+                node_limit=bfs_node_budget,
+                local_deadline=min(pair_deadline - 0.3, time.time() + 2.2),
+            )
+            if bfs_path and len(bfs_path) >= 2:
+                path.extend(bfs_path[1:])
+                return _result(pair_id, path, llm_calls, link_counts, True)
 
         # Early 2-hop check over strong candidates only
         if step <= 2:
